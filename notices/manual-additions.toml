@@ -45,9 +45,14 @@ binaries = "all"
 # path to the vendored text). An override only applies when the crate actually
 # appears in the binary being rendered; if absent, it is skipped.
 #
-# governor and asn1-rs-impl carry the real upstream MIT copyright. (bitcode_derive
-# is also MIT with no shipped file, but its repository has no `.git` suffix, so it
-# is resolved by a git clarify in about.toml rather than a vendored override.)
+# governor and asn1-rs-impl carry the real upstream MIT copyright. (bitcode_derive,
+# base64-simd, and vsimd are also MIT with no shipped file, but their repositories
+# have no `.git` suffix, so they are resolved by git clarifies in about.toml rather
+# than vendored overrides.) rs-consul is MIT but ships no license file in its
+# published crate and carries none in its repository at the published commit, so no
+# git clarify can reach it. Its published crate declares `authors = ["Roblox"]`
+# and no copyright holder, so the canonical MIT text is vendored attributed to
+# that declared author.
 # linux-keyutils ("Apache-2.0 OR MIT", no notice anywhere), objc2-core-foundation,
 # and objc2-io-kit ("Zlib OR Apache-2.0 OR MIT", part of the madsmtm/objc2
 # monorepo, ship no per-work copyright line) all render under Apache-2.0 from
@@ -65,6 +70,12 @@ name = "asn1-rs-impl"
 version = "0.2.0"
 spdx = "MIT"
 license = "notices/license-overrides/asn1-rs-impl.LICENSE"
+
+[[override]]
+name = "rs-consul"
+version = "0.13.0"
+spdx = "MIT"
+license = "notices/license-overrides/rs-consul.LICENSE"
 
 [[override]]
 name = "linux-keyutils"
