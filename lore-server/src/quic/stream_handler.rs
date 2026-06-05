@@ -79,6 +79,7 @@ where
     handler_duration_timeout: Option<Duration>,
     latency_histogram: Histogram<f64>,
     peak_pending_chunks_histogram: Histogram<u64>,
+    pending_chunk_stall_histogram: Histogram<u64>,
 }
 
 impl<ServiceType> StreamHandler<ServiceType>
@@ -96,7 +97,16 @@ where
             provider.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME);
         let peak_pending_chunks_histogram = provider.length_histogram(
             "stream.peak_pending_chunks",
-            vec![1., 5., 10., 25., 50., 100., 250., 500., 1000.],
+            vec![
+                1., 5., 10., 25., 50., 100., 250., 500., 1_000., 2_500., 5_000., 10_000., 25_000.,
+                50_000., 100_000.,
+            ],
+        );
+        let pending_chunk_stall_histogram = provider.length_histogram(
+            "stream.peak_pending_chunk_stall_duration",
+            vec![
+                1., 5., 10., 25., 50., 100., 250., 500., 1_000., 2_500., 5_000., 10_000.,
+            ],
         );
         Self {
             service,
@@ -105,6 +115,7 @@ where
             handler_duration_timeout,
             latency_histogram,
             peak_pending_chunks_histogram,
+            pending_chunk_stall_histogram,
         }
     }
 
@@ -451,6 +462,8 @@ where
         )];
         let mut peak_pending = DropRecord::new(self.peak_pending_chunks_histogram.clone(), &labels);
         let mut max_pending: usize = 0;
+        let mut peak_stall = DropRecord::new(self.pending_chunk_stall_histogram.clone(), &labels);
+        let mut stall_start = Instant::now();
 
         let send = Arc::new(Mutex::new(send));
 
@@ -581,6 +594,9 @@ where
                     "Got out of order chunk @ offset {}, current offset is {}",
                     chunk.offset, current_offset
                 );
+                if pending_chunks.is_empty() {
+                    stall_start = Instant::now();
+                }
                 pending_chunks.push(chunk);
                 if pending_chunks.len() > max_pending {
                     peak_pending.add((pending_chunks.len() - max_pending) as u64);
@@ -595,6 +611,12 @@ where
                         pending_chunks.len() - 1
                     );
                     next_chunk = Some(pending_chunks.swap_remove(ichunk));
+                    if pending_chunks.is_empty() {
+                        let stall_ms = stall_start.elapsed().as_millis() as u64;
+                        if stall_ms > peak_stall.get() {
+                            peak_stall.set(stall_ms);
+                        }
+                    }
                     break;
                 }
             }

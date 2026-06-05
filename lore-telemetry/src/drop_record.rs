@@ -23,6 +23,14 @@ impl<'a> DropRecord<'a> {
     pub fn add(&mut self, value: u64) {
         self.count += value;
     }
+
+    pub fn set(&mut self, value: u64) {
+        self.count = value;
+    }
+
+    pub fn get(&self) -> u64 {
+        self.count
+    }
 }
 
 impl<'a> Drop for DropRecord<'a> {
