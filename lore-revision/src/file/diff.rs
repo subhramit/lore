@@ -15,6 +15,7 @@ use crate::event;
 use crate::event::EventError;
 use crate::immutable;
 use crate::immutable::read_options_from_repository;
+use crate::infer::infer_is_diffable_by_slice;
 use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
@@ -29,6 +30,7 @@ use crate::state;
 use crate::state::State;
 use crate::util::collect_stream::collect_stream;
 use crate::util::encoding::decode_text_for_display;
+use crate::util::encoding::is_utf16_bom;
 use crate::util::path::RelativePath;
 
 /// Default number of unchanged context lines around each unified-diff hunk.
@@ -353,12 +355,12 @@ async fn emit_diff3_changes(
         let base_content = if is_from_file {
             diff_read_file(repository.clone(), Some(state_base.clone()), &change.path).await?
         } else {
-            String::new()
+            DiffContent::empty()
         };
         let target_content = if is_to_file {
             diff_read_file(repository.clone(), state_target.clone(), &change.path).await?
         } else {
-            String::new()
+            DiffContent::empty()
         };
         // Baseline content: try-read since NodeChange flags don't cover the baseline state
         let source_content = match diff_read_file(
@@ -369,7 +371,7 @@ async fn emit_diff3_changes(
         .await
         {
             Ok(content) => content,
-            Err(ref e) if e.is_file_not_found() => String::new(),
+            Err(ref e) if e.is_file_not_found() => DiffContent::empty(),
             Err(e) => return Err(e),
         };
 
@@ -383,6 +385,12 @@ async fn emit_diff3_changes(
             LoreFileAction::Add
         };
 
+        // Binary content: emit a marker instead of rendering bytes as text.
+        if base_content.is_binary() || source_content.is_binary() || target_content.is_binary() {
+            emit_binary_diff(&change.path, action);
+            continue;
+        }
+
         let target_label = if let Some(state_target) = state_target.as_ref() {
             format!(
                 "{}@{}",
@@ -393,7 +401,7 @@ async fn emit_diff3_changes(
             change.path.as_str().to_string()
         };
 
-        if base_content == source_content {
+        if base_content.text() == source_content.text() {
             // Only the target branch modified this file
             let from_label = if is_from_file {
                 format!("{}@{}", change.path.as_str(), state_base.revision_number())
@@ -406,8 +414,8 @@ async fn emit_diff3_changes(
                 "/dev/null".to_string()
             };
             emit_diff_event(
-                &base_content,
-                &target_content,
+                base_content.text(),
+                target_content.text(),
                 &from_label,
                 &to_label,
                 &change.path,
@@ -417,9 +425,9 @@ async fn emit_diff3_changes(
         } else {
             // Both branches modified; merge to isolate the target branch's contribution
             let merge_result = match merge3_text(
-                &base_content,
-                &source_content,
-                &target_content,
+                base_content.text(),
+                source_content.text(),
+                target_content.text(),
                 None,
                 None,
                 None,
@@ -436,7 +444,7 @@ async fn emit_diff3_changes(
             };
 
             emit_diff_event(
-                &source_content,
+                source_content.text(),
                 &merge_result,
                 &format!(
                     "{}@{}",
@@ -493,7 +501,7 @@ async fn emit_diff3_conflicts(
             )
             .await?
         } else {
-            String::new()
+            DiffContent::empty()
         };
         let source = if source_has_file {
             diff_read_file(
@@ -503,7 +511,7 @@ async fn emit_diff3_conflicts(
             )
             .await?
         } else {
-            String::new()
+            DiffContent::empty()
         };
         let target = if target_has_file {
             diff_read_file(
@@ -513,8 +521,14 @@ async fn emit_diff3_conflicts(
             )
             .await?
         } else {
-            String::new()
+            DiffContent::empty()
         };
+
+        // Binary content: emit a marker instead of three-way merging bytes.
+        if base.is_binary() || source.is_binary() || target.is_binary() {
+            emit_binary_diff(&source_change.path, LoreFileAction::Keep);
+            continue;
+        }
 
         let source_label = format!("source@{}", state_source.revision_number());
         let target_label = if let Some(state_target) = state_target.as_ref() {
@@ -525,9 +539,9 @@ async fn emit_diff3_conflicts(
 
         // mine = CLI --source, theirs = CLI --target
         match merge3_text(
-            &base,
-            &source,
-            &target,
+            base.text(),
+            source.text(),
+            target.text(),
             Some(&format!("base@{}", state_base.revision_number())),
             Some(&source_label),
             Some(&target_label),
@@ -536,7 +550,7 @@ async fn emit_diff3_conflicts(
                 // Clean merge — both modified but no overlapping hunks.
                 // Diff baseline to merge result to show the target branch's contribution.
                 emit_diff_event(
-                    &source,
+                    source.text(),
                     &merge_result,
                     &source_label,
                     &format!("{target_label} (merged)"),
@@ -615,9 +629,13 @@ async fn emit_unified_diffs(
                     .await?;
             let target =
                 diff_read_file(repository.clone(), state_target.clone(), &change.path).await?;
+            if source.is_binary() || target.is_binary() {
+                emit_binary_diff(&change.path, action);
+                continue;
+            }
             emit_diff_event(
-                &source,
-                &target,
+                source.text(),
+                target.text(),
                 &source_label,
                 &target_label,
                 &change.path,
@@ -628,8 +646,12 @@ async fn emit_unified_diffs(
             let source =
                 diff_read_file(repository.clone(), Some(state_source.clone()), &change.path)
                     .await?;
+            if source.is_binary() {
+                emit_binary_diff(&change.path, action);
+                continue;
+            }
             emit_diff_event(
-                &source,
+                source.text(),
                 "",
                 &source_label,
                 "/dev/null",
@@ -640,9 +662,13 @@ async fn emit_unified_diffs(
         } else if action == LoreFileAction::Add {
             let target =
                 diff_read_file(repository.clone(), state_target.clone(), &change.path).await?;
+            if target.is_binary() {
+                emit_binary_diff(&change.path, action);
+                continue;
+            }
             emit_diff_event(
                 "",
-                &target,
+                target.text(),
                 "/dev/null",
                 change.path.as_str(),
                 &change.path,
@@ -653,6 +679,19 @@ async fn emit_unified_diffs(
     }
 
     Ok(())
+}
+
+/// Emit a `Binary files differ` marker as a `FileDiff` event, bypassing the
+/// text diff/merge pipeline. Used when any participating side of a diff is
+/// detected as binary, so raw bytes are never rendered through the lossy text
+/// decoder (which would produce U+FFFD replacement characters).
+fn emit_binary_diff(path: &RelativePath, action: LoreFileAction) {
+    event::LoreEvent::FileDiff(LoreFileDiffEventData {
+        path: path.clone().into(),
+        patch: "Binary files differ\n".into(),
+        action,
+    })
+    .send();
 }
 
 /// Format a unified diff with proper labels and emit as a `FileDiff` event.
@@ -851,17 +890,64 @@ fn write_patch_line(out: &mut String, sign: char, line: &str) {
     }
 }
 
+/// One side of a diff: either decoded display text, or a marker that the raw
+/// bytes were detected as binary (non-text) content. Binary content carries no
+/// text — it is never rendered through the diff/merge pipeline.
+enum DiffContent {
+    Text(String),
+    Binary,
+}
+
+impl DiffContent {
+    /// An absent side (file missing on this revision / `/dev/null`). Treated as
+    /// empty text, never binary.
+    fn empty() -> Self {
+        DiffContent::Text(String::new())
+    }
+
+    fn is_binary(&self) -> bool {
+        matches!(self, DiffContent::Binary)
+    }
+
+    /// The decoded text for a text side; `""` for binary. Callers short-circuit
+    /// on `is_binary()` before reaching this, so the binary case is never read
+    /// in practice.
+    fn text(&self) -> &str {
+        match self {
+            DiffContent::Text(s) => s,
+            DiffContent::Binary => "",
+        }
+    }
+}
+
+/// Build display content from raw bytes.
+///
+/// An empty buffer (an absent side) is text, not binary. UTF-16 BOM input is
+/// exempt from the binary check: `decode_text_for_display` renders it as
+/// readable text, and the diff path intentionally shows UTF-16 as text — unlike
+/// the merge path, where `infer_is_diffable_by_slice` treats UTF-16 as binary
+/// to preserve bytes. Everything else (null bytes, non-text MIME, Unreal
+/// packages, invalid UTF-8) is classified as binary, and its bytes are never
+/// decoded.
+fn make_diff_content(bytes: &[u8]) -> DiffContent {
+    if !bytes.is_empty() && !is_utf16_bom(bytes) && !infer_is_diffable_by_slice(bytes) {
+        DiffContent::Binary
+    } else {
+        DiffContent::Text(decode_text_for_display(bytes))
+    }
+}
+
 async fn diff_read_file(
     repository: Arc<RepositoryContext>,
     state: Option<Arc<State>>,
     relative_path: &RelativePath,
-) -> Result<String, DiffError> {
+) -> Result<DiffContent, DiffError> {
     let Some(state) = state else {
         let path = relative_path.to_absolute_path(repository.require_path()?);
         let content = tokio::fs::read(path.as_path())
             .await
             .internal(&format!("Failed reading file for diff: {}", path.display()))?;
-        return Ok(decode_text_for_display(&content));
+        return Ok(make_diff_content(&content));
     };
 
     let node_link = state
@@ -907,12 +993,56 @@ async fn diff_read_file(
     .await
     .forward::<DiffError>("Failed reading data for diff")?;
 
-    Ok(decode_text_for_display(&content))
+    Ok(make_diff_content(&content))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn make_diff_content_empty_is_text() {
+        let c = make_diff_content(b"");
+        assert!(!c.is_binary());
+        assert_eq!(c.text(), "");
+    }
+
+    #[test]
+    fn make_diff_content_valid_utf8_is_text() {
+        let c = make_diff_content(b"hello\nworld\n");
+        assert!(!c.is_binary());
+        assert_eq!(c.text(), "hello\nworld\n");
+    }
+
+    #[test]
+    fn make_diff_content_utf16_le_bom_is_text() {
+        // UTF-16 BOM is exempt: the diff path renders it as readable text,
+        // matching the test_file_diff_utf16be smoke test.
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend("Hi\n".encode_utf16().flat_map(u16::to_le_bytes));
+        let c = make_diff_content(&bytes);
+        assert!(!c.is_binary(), "UTF-16 LE BOM must remain diffable as text");
+        assert_eq!(c.text(), "Hi\n");
+    }
+
+    #[test]
+    fn make_diff_content_null_bytes_is_binary() {
+        let c = make_diff_content(&[0x00, 0x01, 0x02, 0xFF, 0xFE, 0x00]);
+        assert!(c.is_binary());
+    }
+
+    #[test]
+    fn make_diff_content_invalid_utf8_is_binary() {
+        let c = make_diff_content(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(c.is_binary());
+    }
+
+    #[test]
+    fn diff_content_empty_constructor_is_text() {
+        let c = DiffContent::empty();
+        assert!(!c.is_binary());
+        assert_eq!(c.text(), "");
+    }
 
     #[test]
     fn normalise_line_strips_trailing_whitespace() {

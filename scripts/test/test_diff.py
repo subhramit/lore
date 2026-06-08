@@ -1537,3 +1537,110 @@ def test_branch_diff_auto_resolve_no_write_required(new_lore_repo):
         "Auto-resolved file should appear as modified\n"
         "Output:\n" + output
     )
+
+
+@pytest.mark.smoke
+def test_file_diff_binary_emits_marker(new_lore_repo):
+    """`lore diff` on binary content must emit a `Binary files differ` marker,
+    not garbled bytes rendered through the lossy text decoder."""
+    repo: Lore = new_lore_repo()
+
+    binary_file = "binary-test.bin"
+    base_bytes = bytes(
+        [0x00, 0x01, 0x02, 0xFF, 0xFE, 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A,
+         0x1A, 0x0A, 0xDE, 0xAD, 0xBE, 0xEF]
+    )
+
+    repo.write_commit_push(
+        "Initial binary file",
+        {binary_file: base_bytes},
+        offline=True,
+    )
+
+    repo.branch_create("feature", offline=True)
+
+    feature_bytes = bytes(
+        [0x00, 0x01, 0x02, 0xFF, 0xFE, 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A,
+         0x1A, 0x0A, 0xCA, 0xFE, 0xBA, 0xBE]
+    )
+    repo.write_commit_push(
+        "Modify binary on feature",
+        {binary_file: feature_bytes},
+        offline=True,
+    )
+    feature_rev = repo.revision_info(offline=True).signature
+
+    repo.branch_switch("main", offline=True)
+    main_rev = repo.revision_info(offline=True).signature
+
+    output = repo.file_diff(
+        binary_file, source=feature_rev, target=main_rev, offline=True
+    )
+
+    assert "Binary files differ" in output, (
+        "Binary diff should emit a `Binary files differ` marker.\nOutput:\n"
+        + output
+    )
+    assert "\ufffd" not in output, (
+        "Binary diff must not render replacement characters.\nOutput:\n"
+        + repr(output)
+    )
+    assert "@@" not in output, (
+        "Binary diff must not emit a unified-diff hunk header.\nOutput:\n"
+        + output
+    )
+
+
+@pytest.mark.smoke
+def test_file_diff3_binary_emits_marker(new_lore_repo):
+    """`lore diff --diff3` on binary content must emit a `Binary files differ`
+    marker rather than conflict markers wrapping garbled bytes."""
+    repo: Lore = new_lore_repo()
+
+    binary_file = "binary-test.bin"
+    base_bytes = bytes(
+        [0x00, 0x01, 0x02, 0xFF, 0xFE, 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A,
+         0x1A, 0x0A, 0xDE, 0xAD, 0xBE, 0xEF]
+    )
+
+    repo.write_commit_push(
+        "Initial binary file",
+        {binary_file: base_bytes},
+        offline=True,
+    )
+
+    repo.branch_create("feature", offline=True)
+    feature_bytes = base_bytes + bytes([0x11, 0x22, 0x33])
+    repo.write_commit_push(
+        "Modify binary on feature",
+        {binary_file: feature_bytes},
+        offline=True,
+    )
+    feature_rev = repo.revision_info(offline=True).signature
+
+    repo.branch_switch("main", offline=True)
+    main_bytes = bytes([0x44, 0x55, 0x66]) + base_bytes
+    repo.write_commit_push(
+        "Modify binary on main",
+        {binary_file: main_bytes},
+        offline=True,
+    )
+    main_rev = repo.revision_info(offline=True).signature
+
+    output = repo.file_diff(
+        binary_file, source=main_rev, target=feature_rev, diff3=True, offline=True
+    )
+
+    assert "Binary files differ" in output, (
+        "Binary diff3 should emit a `Binary files differ` marker.\nOutput:\n"
+        + output
+    )
+    assert "\ufffd" not in output, (
+        "Binary diff3 must not render replacement characters.\nOutput:\n"
+        + repr(output)
+    )
+    for marker in ("<<<<<<<", "=======", ">>>>>>>"):
+        assert marker not in output, (
+            f"Binary diff3 must not emit conflict marker {marker!r}.\nOutput:\n"
+            + output
+        )
