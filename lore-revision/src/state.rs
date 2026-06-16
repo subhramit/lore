@@ -4491,6 +4491,40 @@ pub struct LayerMountInfo {
     pub source_node: NodeID,
 }
 
+/// Information about a link mount in the current state, gathered once at the
+/// top of `diff_filesystem_ex` so the per-directory walk can detect "this
+/// filesystem directory is a link, not a fresh add" with a single linear
+/// `find` instead of an async block-walk per directory.
+///
+/// Only `target_path` is needed today because the link-mount handling skips
+/// recursion entirely (the link is the parent-tree change; its content is
+/// owned by the linked repository). If we later want the walker to recurse
+/// into a linked state for some operation, extend this struct rather than
+/// re-introducing the per-directory `find_node_link` lookup.
+struct LinkMountInfo {
+    /// Parent-relative mount path of the link node (e.g. `"libs/shared"`).
+    target_path: String,
+}
+
+/// Enumerate every link in `state` and resolve its parent-relative mount
+/// path. The result is shared by reference through `DiffFilesystemContext`
+/// so the per-directory walk avoids an O(depth) block-walk per new directory
+/// on fresh checkouts.
+async fn collect_link_mounts(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+) -> Result<Vec<LinkMountInfo>, StateError> {
+    let link_list = state.link_list(repository.clone()).await?;
+    let mut mounts = Vec::with_capacity(link_list.len());
+    for link_ref in link_list.iter() {
+        let target_path = state
+            .node_path(repository.clone(), link_ref.local_node as NodeID)
+            .await?;
+        mounts.push(LinkMountInfo { target_path });
+    }
+    Ok(mounts)
+}
+
 /// Calculate the set of changes from state to filesystem. Since the file system timestamp tracking
 /// only tells if a file is unmodified compared to last write, we need the current state as well to
 /// tell what that last write was.
@@ -4535,6 +4569,7 @@ pub async fn diff_filesystem_ex(
     scan_dirty: bool,
     layer_mounts: Arc<Vec<LayerMountInfo>>,
 ) -> Result<(Vec<NodeChange>, FilesystemDiffStats), StateError> {
+    let link_mounts = Arc::new(collect_link_mounts(&state_current, &repository_current).await?);
     if let Some(path) = path {
         let excluded = repository_from
             .filter
@@ -4584,6 +4619,7 @@ pub async fn diff_filesystem_ex(
             filter_mode,
             scan_dirty,
             layer_mounts,
+            link_mounts,
         })
         .await
     } else {
@@ -4604,6 +4640,7 @@ pub async fn diff_filesystem_ex(
             filter_mode,
             scan_dirty,
             layer_mounts,
+            link_mounts,
         })
         .await
     }
@@ -4690,6 +4727,7 @@ struct DiffFilesystemContext {
     filter_mode: FilterMode,
     scan_dirty: bool,
     layer_mounts: Arc<Vec<LayerMountInfo>>,
+    link_mounts: Arc<Vec<LinkMountInfo>>,
 }
 
 /// Calculate the set of changes from state to filesystem for a subsection of the tree.
@@ -4706,6 +4744,7 @@ pub async fn diff_filesystem_subtree(
     filter_mode: FilterMode,
     layer_mounts: Arc<Vec<LayerMountInfo>>,
 ) -> Result<(Vec<NodeChange>, FilesystemDiffStats), StateError> {
+    let link_mounts = Arc::new(collect_link_mounts(&state_current, &repository_current).await?);
     diff_filesystem_subtree_impl(DiffFilesystemContext {
         from: FilesystemTraversal {
             repository: repository_from,
@@ -4723,6 +4762,7 @@ pub async fn diff_filesystem_subtree(
         filter_mode,
         scan_dirty: false,
         layer_mounts,
+        link_mounts,
     })
     .await
 }
@@ -5737,6 +5777,9 @@ async fn diff_filesystem_directory_walk(
                     filter_mode,
                     scan_dirty,
                     layer_mounts: layer_mounts_recurse,
+                    // Crossing into the linked state; parent's link mounts
+                    // are paths in the parent tree and do not apply here.
+                    link_mounts: Arc::new(vec![]),
                 })
                 .await
             });
@@ -5784,7 +5827,8 @@ async fn diff_filesystem_directory_walk(
             let repository_current = current_node_list.repository.clone();
             let state_current = current_node_list.state.clone();
             let subnode_from = from_named_node.node;
-            let (repository_current, state_current, subnode_current) = if current_node.is_link() {
+            let current_is_link = current_node.is_link();
+            let (repository_current, state_current, subnode_current) = if current_is_link {
                 let link = current_node.linked_node();
                 let (linked_repository, state) = link
                     .resolve(repository_current.clone(), state_current.clone())
@@ -5794,6 +5838,14 @@ async fn diff_filesystem_directory_walk(
                 (repository_current, state_current.clone(), current_node_id)
             };
             let layer_mounts_recurse = ctx.layer_mounts.clone();
+            // Stay in the parent's link mounts when recursing into a normal
+            // sub-directory; reset when crossing into a linked state because
+            // those mount paths are in the parent tree, not the linked tree.
+            let link_mounts_recurse = if current_is_link {
+                Arc::new(vec![])
+            } else {
+                ctx.link_mounts.clone()
+            };
             let filter_mode = ctx.filter_mode;
             let scan_dirty = ctx.scan_dirty;
             lore_spawn!(tasks, async move {
@@ -5814,6 +5866,7 @@ async fn diff_filesystem_directory_walk(
                     filter_mode,
                     scan_dirty,
                     layer_mounts: layer_mounts_recurse,
+                    link_mounts: link_mounts_recurse,
                 })
                 .await
             });
@@ -5975,6 +6028,29 @@ async fn diff_filesystem_directory_walk(
         let is_directory = file.metadata.is_dir();
 
         if is_directory {
+            // A directory on disk with no `state_from` node that matches a
+            // link in `state_current` is a link add, not a per-file add: the
+            // mounted content belongs to the linked repository. Skip the
+            // entry; the link node is reported via `state::diff_collect` (in
+            // `lore status`) and `link list`, not via `file diff`.
+            //
+            // The realistic scan-side caller (`lore status` via
+            // `diff_filesystem_ex`) stages the link in `state_from` before
+            // status runs, so the link is matched in the paired
+            // `was_link && is_directory` branch above and never reaches here;
+            // the `continue` fires with `scan_dirty == true` only in a
+            // constructed corner case, where skipping dirty-add is still
+            // correct (the link is not new in the working state).
+            if ctx
+                .link_mounts
+                .iter()
+                .any(|m| m.target_path == child_file_path.as_str())
+            {
+                lore_trace!(
+                    "Filesystem path {child_file_path} matches a link in the current state, skipping link-internal content"
+                );
+                continue 'new_file_iter;
+            }
             // Layer mount detection: if this directory's parent-relative path
             // matches a configured layer mount, switch comparison context to
             // the layer's repo and state for the recursion. The layer mount
@@ -6012,6 +6088,9 @@ async fn diff_filesystem_directory_walk(
                         scan_dirty: ctx.scan_dirty,
                         // Non-overlapping layers: no nested mounts inside a layer.
                         layer_mounts: Arc::new(vec![]),
+                        // Crossing into the layer state; parent's link mounts
+                        // are paths in the parent tree and do not apply here.
+                        link_mounts: Arc::new(vec![]),
                     },)
                 );
                 continue 'new_file_iter;
@@ -6092,6 +6171,8 @@ async fn diff_filesystem_directory_walk(
                     filter_mode: ctx.filter_mode,
                     scan_dirty: ctx.scan_dirty,
                     layer_mounts: ctx.layer_mounts.clone(),
+                    // Same parent state; deeper paths may still match a link.
+                    link_mounts: ctx.link_mounts.clone(),
                 })
             );
 
