@@ -546,9 +546,14 @@ fn validate_endpoint_security(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn launch_grpc_internal_server(
     settings: Settings,
     user_agent_filter: Arc<UserAgentFilter>,
+    immutable_store: Arc<dyn ImmutableStore>,
+    mutable_store: Arc<dyn MutableStore>,
+    notification_sender: Arc<dyn NotificationSender>,
+    hook_dispatcher: Arc<HookDispatcher>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let grpc_settings = settings
@@ -572,10 +577,18 @@ async fn launch_grpc_internal_server(
             (None, None, None)
         };
 
+    let rpc_timeout = Duration::from_secs(grpc_settings.request_handler_timeout_seconds);
+
     GrpcInternalServerBuilder::new()
-        .with_local_immutable_store(local_store().ok_or(anyhow!(
-            "Cannot configure gRPC internal server, no local store"
-        ))?)?
+        .with_components(
+            local_store().ok_or(anyhow!(
+                "Cannot configure gRPC internal server, no local store"
+            ))?,
+            immutable_store,
+            mutable_store,
+            notification_sender,
+            hook_dispatcher,
+        )?
         .with_tls_config(cert_path, key_path, cert_chain_path)?
         .with_http2_config(
             grpc_settings
@@ -585,6 +598,7 @@ async fn launch_grpc_internal_server(
                 .http2_keepalive_timeout_seconds
                 .map(Duration::from_secs),
             user_agent_filter,
+            rpc_timeout,
         )?
         .serve(addr, async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
@@ -1798,39 +1812,51 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 settings,
                 notification,
                 notification_service,
-                hook_dispatcher,
+                hook_dispatcher.clone(),
                 user_agent_filter,
                 shutdown_rx,
             )
         });
+
+        if let Some(grpc_internal) = &settings.server.grpc_internal
+            && grpc_internal.enabled
+        {
+            let security = validate_endpoint_security(
+                "[server.grpc_internal]",
+                grpc_internal.certificate.as_ref(),
+                grpc_internal.verify_client_certs,
+            )?;
+            if security == EndpointSecurity::Untrusted {
+                warn!(
+                    "[server.grpc_internal] starting WITHOUT mTLS because verify_client_certs=false. \
+                     The gRPC internal endpoint grants blanket access to every storage partition; \
+                     only safe on isolated networks with no untrusted clients"
+                );
+            }
+            lore_spawn!(endpoints, {
+                let settings = settings.clone();
+                let user_agent_filter = user_agent_filter.clone();
+                let immutable_store = immutable_store.clone();
+                let mutable_store = mutable_store.clone();
+                let notification_sender = notification.clone();
+                let hook_dispatcher = hook_dispatcher.clone();
+                let shutdown_rx = _shutdown_rx.clone();
+                launch_grpc_internal_server(
+                    settings,
+                    user_agent_filter,
+                    immutable_store,
+                    mutable_store,
+                    notification_sender,
+                    hook_dispatcher,
+                    shutdown_rx,
+                )
+            });
+        }
     } else {
         lore_spawn!(endpoints, {
             let settings = settings.clone();
             let shutdown_rx = _shutdown_rx.clone();
             launch_maintenance_grpc_server(settings, shutdown_rx)
-        });
-    }
-
-    if let Some(grpc_internal) = &settings.server.grpc_internal
-        && grpc_internal.enabled
-    {
-        let security = validate_endpoint_security(
-            "[server.grpc_internal]",
-            grpc_internal.certificate.as_ref(),
-            grpc_internal.verify_client_certs,
-        )?;
-        if security == EndpointSecurity::Untrusted {
-            warn!(
-                "[server.grpc_internal] starting WITHOUT mTLS because verify_client_certs=false. \
-                 The gRPC internal endpoint grants blanket access to every storage partition; \
-                 only safe on isolated networks with no untrusted clients"
-            );
-        }
-        lore_spawn!(endpoints, {
-            let settings = settings.clone();
-            let user_agent_filter = user_agent_filter.clone();
-            let shutdown_rx = _shutdown_rx.clone();
-            launch_grpc_internal_server(settings, user_agent_filter, shutdown_rx)
         });
     }
 
